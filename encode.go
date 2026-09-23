@@ -11,6 +11,29 @@ type Marshaler interface {
 	MarshalPlist() (interface{}, error)
 }
 
+// asMarshaler reports whether v, or a pointer to it, implements Marshaler.
+//
+// The check is made against the value's dynamic type rather than its static
+// one, so that a Marshaler held in an interface{} — as a struct field, a slice
+// element or a map value — is still found. Testing the static type would see
+// only the empty interface, which implements nothing, and the value would be
+// silently encoded by reflection instead.
+func asMarshaler(v reflect.Value) (Marshaler, bool) {
+	if v.CanInterface() {
+		if m, ok := v.Interface().(Marshaler); ok {
+			return m, true
+		}
+	}
+	if v.CanAddr() {
+		if pv := v.Addr(); pv.CanInterface() {
+			if m, ok := pv.Interface().(Marshaler); ok {
+				return m, true
+			}
+		}
+	}
+	return nil, false
+}
+
 // Encoder ...
 type Encoder struct {
 	w io.Writer
@@ -49,6 +72,12 @@ func (e *Encoder) Encode(v interface{}) error {
 	if err != nil {
 		return err
 	}
+	// Nested nils are dropped by their container, but a nil root has no
+	// container to drop it, and an empty <plist> is not a document this
+	// package can read back.
+	if pval == nil {
+		return &UnsupportedValueError{reflect.ValueOf(v), "nil"}
+	}
 
 	enc := newXMLEncoder(e.w)
 	enc.indent = e.indent
@@ -61,11 +90,17 @@ func (e *Encoder) Indent(indent string) {
 	e.indent = indent
 }
 
+// marshal converts v into a plistValue. A nil pointer or interface has no
+// property list representation, so it yields a nil plistValue and no error;
+// callers decide what to do with it.
 func (e *Encoder) marshal(v reflect.Value) (*plistValue, error) {
-	marshalerType := reflect.TypeOf((*Marshaler)(nil)).Elem()
+	// A nil interface reaches us as the zero Value, which has no type to
+	// inspect.
+	if !v.IsValid() {
+		return nil, nil
+	}
 
-	if v.CanInterface() && v.Type().Implements(marshalerType) {
-		m := v.Interface().(Marshaler)
+	if m, ok := asMarshaler(v); ok {
 		val, err := m.MarshalPlist()
 		if err != nil {
 			return nil, err
@@ -73,20 +108,14 @@ func (e *Encoder) marshal(v reflect.Value) (*plistValue, error) {
 		return e.marshal(reflect.ValueOf(val))
 	}
 
-	if v.CanAddr() {
-		pv := v.Addr()
-		if pv.CanInterface() && pv.Type().Implements(marshalerType) {
-			m := pv.Interface().(Marshaler)
-			val, err := m.MarshalPlist()
-			if err != nil {
-				return nil, err
-			}
-			return e.marshal(reflect.ValueOf(val))
+	// Descend through empty interfaces and pointers to the concrete value they
+	// hold. This has to be a loop rather than a single step: an interface{}
+	// holding a *string is two levels deep, and stopping at the first would
+	// leave a pointer the switch below cannot encode.
+	for (v.Kind() == reflect.Interface && v.NumMethod() == 0) || v.Kind() == reflect.Ptr {
+		if v.IsNil() {
+			return nil, nil
 		}
-	}
-
-	// check for empty interface v type
-	if v.Kind() == reflect.Interface && v.NumMethod() == 0 || v.Kind() == reflect.Ptr {
 		v = v.Elem()
 	}
 
@@ -135,9 +164,14 @@ func (e *Encoder) marshalStruct(v reflect.Value) (*plistValue, error) {
 		if field.omitEmpty && isEmptyValue(val) {
 			continue
 		}
-		value, err := e.marshal(field.value(v))
+		value, err := e.marshal(val)
 		if err != nil {
 			return nil, err
+		}
+		if value == nil {
+			// A nil field has no property list representation; an absent key
+			// is the closest equivalent.
+			continue
 		}
 		dict.m[field.name] = value
 	}
@@ -155,15 +189,18 @@ func (e *Encoder) marshalArray(v reflect.Value) (*plistValue, error) {
 		}
 		return &plistValue{Data, bytes}, nil
 	}
-	subvalues := make([]*plistValue, v.Len())
+	// Nil elements have no property list representation and are dropped, so
+	// the encoded array can be shorter than v.
+	subvalues := make([]*plistValue, 0, v.Len())
 	for idx, length := 0, v.Len(); idx < length; idx++ {
 		subpval, err := e.marshal(v.Index(idx))
 		if err != nil {
 			return nil, err
 		}
-		if subpval != nil {
-			subvalues[idx] = subpval
+		if subpval == nil {
+			continue
 		}
+		subvalues = append(subvalues, subpval)
 	}
 	return &plistValue{Array, subvalues}, nil
 }

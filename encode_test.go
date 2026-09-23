@@ -453,3 +453,247 @@ func TestEncodeDecodeUIDRoundtripIncompatibleType(t *testing.T) {
 		t.Error("Expected error when decoding UID to string")
 	}
 }
+
+// xmlDoc wraps a plist body in the header the encoder emits, so that the tests
+// below can state just the part they care about.
+func xmlDoc(body string) string {
+	return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">` + body + `</plist>
+`
+}
+
+// valueMarshaler implements Marshaler with a value receiver, so both it and
+// *valueMarshaler satisfy the interface even when stored in an interface{}.
+type valueMarshaler struct {
+	Field string
+}
+
+func (v valueMarshaler) MarshalPlist() (interface{}, error) {
+	return map[string]string{"marshaled": v.Field}, nil
+}
+
+// marshaledRef is what valueMarshaler must encode to. If MarshalPlist is
+// skipped the encoder falls back to reflecting over the struct and emits the
+// exported field name instead, which is what these tests guard against.
+const marshaledRef = `<dict><key>marshaled</key><string>x</string></dict>`
+
+// TestMarshalerThroughInterface checks that a Marshaler is honored when it is
+// reached through an interface{}. The interface's static type implements
+// nothing, so the marshaler is only found by inspecting the dynamic type.
+func TestMarshalerThroughInterface(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name string
+		in   interface{}
+		out  string
+	}{
+		{
+			name: "struct field",
+			in:   struct{ X interface{} }{X: valueMarshaler{Field: "x"}},
+			out:  xmlDoc(`<dict><key>X</key>` + marshaledRef + `</dict>`),
+		},
+		{
+			name: "slice element",
+			in:   []interface{}{valueMarshaler{Field: "x"}},
+			out:  xmlDoc(`<array>` + marshaledRef + `</array>`),
+		},
+		{
+			name: "map value",
+			in:   map[string]interface{}{"k": valueMarshaler{Field: "x"}},
+			out:  xmlDoc(`<dict><key>k</key>` + marshaledRef + `</dict>`),
+		},
+		{
+			name: "pointer in struct field",
+			in:   struct{ X interface{} }{X: &valueMarshaler{Field: "x"}},
+			out:  xmlDoc(`<dict><key>X</key>` + marshaledRef + `</dict>`),
+		},
+		{
+			name: "pointer in map value",
+			in:   map[string]interface{}{"k": &valueMarshaler{Field: "x"}},
+			out:  xmlDoc(`<dict><key>k</key>` + marshaledRef + `</dict>`),
+		},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			b, err := Marshal(tt.in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(b) != tt.out {
+				t.Errorf("Marshal(%v) =\n%s\nwant\n%s", tt.in, b, tt.out)
+			}
+		})
+	}
+}
+
+// TestMarshalNilValue checks that nil pointers and nil interfaces are omitted
+// from dictionaries rather than crashing the encoder. A property list has no
+// null, so an absent key is the closest representation.
+func TestMarshalNilValue(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name string
+		in   interface{}
+		out  string
+	}{
+		{
+			name: "nil pointer struct field",
+			in:   struct{ P *string }{},
+			out:  xmlDoc(`<dict></dict>`),
+		},
+		{
+			name: "nil interface struct field",
+			in:   struct{ X interface{} }{},
+			out:  xmlDoc(`<dict></dict>`),
+		},
+		{
+			name: "nil alongside populated field",
+			in: struct {
+				P *string
+				S string
+			}{S: "here"},
+			out: xmlDoc(`<dict><key>S</key><string>here</string></dict>`),
+		},
+		{
+			name: "nil map value",
+			in:   map[string]interface{}{"a": nil, "b": "x"},
+			out:  xmlDoc(`<dict><key>b</key><string>x</string></dict>`),
+		},
+		{
+			name: "typed nil pointer map value",
+			in:   map[string]interface{}{"a": (*string)(nil), "b": "x"},
+			out:  xmlDoc(`<dict><key>b</key><string>x</string></dict>`),
+		},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			b, err := Marshal(tt.in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(b) != tt.out {
+				t.Errorf("Marshal(%v) =\n%s\nwant\n%s", tt.in, b, tt.out)
+			}
+		})
+	}
+}
+
+// TestMarshalNilArrayElement checks that a nil inside an array is dropped
+// rather than crashing the encoder. A property list has no null, so the
+// element cannot be represented; the array comes out shorter than the slice
+// that produced it.
+func TestMarshalNilArrayElement(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name string
+		in   interface{}
+		out  string
+	}{
+		{
+			name: "nil interface",
+			in:   []interface{}{nil},
+			out:  xmlDoc(`<array></array>`),
+		},
+		{
+			name: "typed nil pointer",
+			in:   []interface{}{(*string)(nil)},
+			out:  xmlDoc(`<array></array>`),
+		},
+		{
+			name: "nil after a value",
+			in:   []interface{}{"a", nil},
+			out:  xmlDoc(`<array><string>a</string></array>`),
+		},
+		{
+			name: "nil between values",
+			in:   []interface{}{"a", nil, "c"},
+			out:  xmlDoc(`<array><string>a</string><string>c</string></array>`),
+		},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			b, err := Marshal(tt.in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(b) != tt.out {
+				t.Errorf("Marshal(%v) =\n%s\nwant\n%s", tt.in, b, tt.out)
+			}
+		})
+	}
+}
+
+// TestMarshalThroughIndirection checks that the encoder reaches the concrete
+// value behind more than one layer of pointer and interface. Stopping after a
+// single layer leaves a pointer the type switch cannot encode.
+func TestMarshalThroughIndirection(t *testing.T) {
+	t.Parallel()
+	s := "x"
+	ps := &s
+	tm := time.Date(1900, 01, 01, 12, 00, 00, 0, time.UTC)
+
+	for _, tt := range []struct {
+		name string
+		in   interface{}
+		out  string
+	}{
+		{
+			name: "pointer in interface",
+			in:   map[string]interface{}{"k": &s},
+			out:  xmlDoc(`<dict><key>k</key><string>x</string></dict>`),
+		},
+		{
+			name: "pointer to pointer",
+			in:   map[string]interface{}{"k": &ps},
+			out:  xmlDoc(`<dict><key>k</key><string>x</string></dict>`),
+		},
+		{
+			name: "time pointer in interface",
+			in:   map[string]interface{}{"k": &tm},
+			out:  xmlDoc(`<dict><key>k</key><date>1900-01-01T12:00:00Z</date></dict>`),
+		},
+		{
+			name: "pointer in slice element",
+			in:   []interface{}{&s},
+			out:  xmlDoc(`<array><string>x</string></array>`),
+		},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			b, err := Marshal(tt.in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(b) != tt.out {
+				t.Errorf("Marshal(%v) =\n%s\nwant\n%s", tt.in, b, tt.out)
+			}
+		})
+	}
+}
+
+// TestMarshalNilRoot checks that a nil with nothing around it reports an
+// error. There is no key or element to drop, and an empty <plist> is not a
+// document this package can read back.
+func TestMarshalNilRoot(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name string
+		in   interface{}
+	}{
+		{"untyped nil", nil},
+		{"typed nil pointer", (*string)(nil)},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := Marshal(tt.in); err == nil {
+				t.Errorf("Marshal(%v) succeeded, want error", tt.in)
+			}
+		})
+	}
+}
