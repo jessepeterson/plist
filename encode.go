@@ -12,6 +12,21 @@ type Marshaler interface {
 	MarshalPlist() (interface{}, error)
 }
 
+// nilReceiver reports whether invoking a method on m would run it against a
+// nil pointer receiver. Addr-derived receivers are never nil, so this only
+// matters for values unboxed from an interface.
+func nilReceiver(m Marshaler) bool {
+	rv := reflect.ValueOf(m)
+	return rv.Kind() == reflect.Ptr && rv.IsNil()
+}
+
+// isIndirect reports whether v wraps another value that can be reached with
+// Elem: a pointer, or an empty interface. Non-empty interfaces are excluded
+// because a value satisfying one may implement Marshaler itself.
+func isIndirect(v reflect.Value) bool {
+	return v.Kind() == reflect.Ptr || (v.Kind() == reflect.Interface && v.NumMethod() == 0)
+}
+
 // asMarshaler reports whether v, or a pointer to it, implements Marshaler.
 //
 // The check is made against the value's dynamic type rather than its static
@@ -21,7 +36,11 @@ type Marshaler interface {
 // silently encoded by reflection instead.
 func asMarshaler(v reflect.Value) (Marshaler, bool) {
 	if v.CanInterface() {
-		if m, ok := v.Interface().(Marshaler); ok {
+		// Unboxing an interface can hand back a typed nil pointer, which
+		// satisfies Marshaler but would run the method against a nil receiver.
+		// Report no marshaler and let the caller's nil handling take over once
+		// it has descended far enough to see the pointer.
+		if m, ok := v.Interface().(Marshaler); ok && !nilReceiver(m) {
 			return m, true
 		}
 	}
@@ -101,21 +120,30 @@ func (e *Encoder) marshal(v reflect.Value) (*plistValue, error) {
 		return nil, nil
 	}
 
-	if m, ok := asMarshaler(v); ok {
-		val, err := m.MarshalPlist()
-		if err != nil {
-			return nil, err
-		}
-		return e.marshal(reflect.ValueOf(val))
-	}
-
 	// Descend through empty interfaces and pointers to the concrete value they
-	// hold. This has to be a loop rather than a single step: an interface{}
-	// holding a *string is two levels deep, and stopping at the first would
-	// leave a pointer the switch below cannot encode.
-	for (v.Kind() == reflect.Interface && v.NumMethod() == 0) || v.Kind() == reflect.Ptr {
-		if v.IsNil() {
+	// hold, looking for a Marshaler at every level on the way down. One level
+	// is not enough: a **T or an *interface{} only reveals the type that
+	// implements Marshaler once it has been unwrapped, and a pointer left
+	// unwrapped is something the switch below cannot encode.
+	for {
+		if isIndirect(v) && v.IsNil() {
+			// Nothing to encode. Returning before the Marshaler check is
+			// deliberate: a nil *T still satisfies the interface, so calling
+			// MarshalPlist here would run the method against a nil receiver.
+			// encoding/json short-circuits nil pointers the same way.
 			return nil, nil
+		}
+
+		if m, ok := asMarshaler(v); ok {
+			val, err := m.MarshalPlist()
+			if err != nil {
+				return nil, err
+			}
+			return e.marshal(reflect.ValueOf(val))
+		}
+
+		if !isIndirect(v) {
+			break
 		}
 		v = v.Elem()
 	}

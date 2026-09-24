@@ -528,6 +528,110 @@ func TestMarshalerThroughInterface(t *testing.T) {
 	}
 }
 
+// ptrMarshaler implements Marshaler with a pointer receiver that dereferences
+// it, so calling the method on a nil *ptrMarshaler panics.
+type ptrMarshaler struct {
+	Field string
+}
+
+func (p *ptrMarshaler) MarshalPlist() (interface{}, error) {
+	return map[string]string{"marshaled": p.Field}, nil
+}
+
+// TestMarshalerThroughIndirection checks that a Marshaler is found however many
+// layers of pointer and interface sit above it. Only looking once, before
+// unwrapping, misses any type that becomes visible further down.
+func TestMarshalerThroughNestedIndirection(t *testing.T) {
+	t.Parallel()
+	iface := interface{}(valueMarshaler{Field: "x"})
+	ptr := &valueMarshaler{Field: "x"}
+
+	for _, tt := range []struct {
+		name string
+		in   interface{}
+		out  string
+	}{
+		{
+			name: "pointer to interface",
+			in:   struct{ P *interface{} }{P: &iface},
+			out:  xmlDoc(`<dict><key>P</key>` + marshaledRef + `</dict>`),
+		},
+		{
+			name: "pointer to interface in map",
+			in:   map[string]interface{}{"k": &iface},
+			out:  xmlDoc(`<dict><key>k</key>` + marshaledRef + `</dict>`),
+		},
+		{
+			name: "pointer to pointer",
+			in:   struct{ P **valueMarshaler }{P: &ptr},
+			out:  xmlDoc(`<dict><key>P</key>` + marshaledRef + `</dict>`),
+		},
+		{
+			name: "pointer to pointer in slice",
+			in:   []interface{}{&ptr},
+			out:  xmlDoc(`<array>` + marshaledRef + `</array>`),
+		},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			b, err := Marshal(tt.in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(b) != tt.out {
+				t.Errorf("Marshal(%v) =\n%s\nwant\n%s", tt.in, b, tt.out)
+			}
+		})
+	}
+}
+
+// TestMarshalNilMarshaler checks that a nil pointer whose type implements
+// Marshaler is omitted rather than having its method invoked. A nil *T still
+// satisfies the interface, so calling through it would run the method against
+// a nil receiver.
+func TestMarshalNilMarshaler(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name string
+		in   interface{}
+		out  string
+	}{
+		{
+			name: "value receiver, struct field",
+			in:   struct{ P *valueMarshaler }{},
+			out:  xmlDoc(`<dict></dict>`),
+		},
+		{
+			name: "pointer receiver, struct field",
+			in:   struct{ P *ptrMarshaler }{},
+			out:  xmlDoc(`<dict></dict>`),
+		},
+		{
+			name: "value receiver, map value",
+			in:   map[string]interface{}{"k": (*valueMarshaler)(nil)},
+			out:  xmlDoc(`<dict></dict>`),
+		},
+		{
+			name: "pointer receiver, map value",
+			in:   map[string]interface{}{"k": (*ptrMarshaler)(nil)},
+			out:  xmlDoc(`<dict></dict>`),
+		},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			b, err := Marshal(tt.in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(b) != tt.out {
+				t.Errorf("Marshal(%v) =\n%s\nwant\n%s", tt.in, b, tt.out)
+			}
+		})
+	}
+}
+
 // TestMarshalNilValue checks that nil pointers and nil interfaces are omitted
 // from dictionaries rather than crashing the encoder. A property list has no
 // null, so an absent key is the closest representation.
