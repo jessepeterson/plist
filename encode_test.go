@@ -581,47 +581,28 @@ func TestMarshalNilValue(t *testing.T) {
 	}
 }
 
-// TestMarshalNilArrayElement checks that a nil inside an array is dropped
-// rather than crashing the encoder. A property list has no null, so the
-// element cannot be represented; the array comes out shorter than the slice
-// that produced it.
+// TestMarshalNilArrayElement checks that a nil inside an array reports an
+// error. A property list has no null, and unlike a dictionary key an array
+// element cannot be left out without shifting every later index, so the
+// encoder refuses rather than quietly returning a shorter array.
 func TestMarshalNilArrayElement(t *testing.T) {
 	t.Parallel()
 	for _, tt := range []struct {
 		name string
 		in   interface{}
-		out  string
 	}{
-		{
-			name: "nil interface",
-			in:   []interface{}{nil},
-			out:  xmlDoc(`<array></array>`),
-		},
-		{
-			name: "typed nil pointer",
-			in:   []interface{}{(*string)(nil)},
-			out:  xmlDoc(`<array></array>`),
-		},
-		{
-			name: "nil after a value",
-			in:   []interface{}{"a", nil},
-			out:  xmlDoc(`<array><string>a</string></array>`),
-		},
-		{
-			name: "nil between values",
-			in:   []interface{}{"a", nil, "c"},
-			out:  xmlDoc(`<array><string>a</string><string>c</string></array>`),
-		},
+		{"nil interface", []interface{}{nil}},
+		{"typed nil pointer", []interface{}{(*string)(nil)}},
+		{"nil after a value", []interface{}{"a", nil}},
+		{"nil between values", []interface{}{"a", nil, "c"}},
+		{"nil in a nested array", []interface{}{[]interface{}{nil}}},
+		{"nil in an array under a key", map[string]interface{}{"k": []interface{}{nil}}},
 	} {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			b, err := Marshal(tt.in)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if string(b) != tt.out {
-				t.Errorf("Marshal(%v) =\n%s\nwant\n%s", tt.in, b, tt.out)
+			if _, err := Marshal(tt.in); err == nil {
+				t.Errorf("Marshal(%v) succeeded, want error", tt.in)
 			}
 		})
 	}

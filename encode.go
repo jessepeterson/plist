@@ -2,6 +2,7 @@ package plist
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"reflect"
 	"time"
@@ -189,18 +190,22 @@ func (e *Encoder) marshalArray(v reflect.Value) (*plistValue, error) {
 		}
 		return &plistValue{Data, bytes}, nil
 	}
-	// Nil elements have no property list representation and are dropped, so
-	// the encoded array can be shorter than v.
-	subvalues := make([]*plistValue, 0, v.Len())
+	subvalues := make([]*plistValue, v.Len())
 	for idx, length := 0, v.Len(); idx < length; idx++ {
 		subpval, err := e.marshal(v.Index(idx))
 		if err != nil {
 			return nil, err
 		}
 		if subpval == nil {
-			continue
+			// A property list has no null. Unlike a dictionary key, an array
+			// element cannot be left out without shifting every later index,
+			// so report it rather than quietly returning a shorter array.
+			return nil, &UnsupportedValueError{
+				v.Index(idx),
+				fmt.Sprintf("nil at array index %d", idx),
+			}
 		}
-		subvalues = append(subvalues, subpval)
+		subvalues[idx] = subpval
 	}
 	return &plistValue{Array, subvalues}, nil
 }
