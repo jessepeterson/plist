@@ -125,6 +125,7 @@ func (e *Encoder) marshal(v reflect.Value) (*plistValue, error) {
 	// is not enough: a **T or an *interface{} only reveals the type that
 	// implements Marshaler once it has been unwrapped, and a pointer left
 	// unwrapped is something the switch below cannot encode.
+	var seen map[uintptr]struct{}
 	for {
 		if isIndirect(v) && v.IsNil() {
 			// Nothing to encode. Returning before the Marshaler check is
@@ -144,6 +145,28 @@ func (e *Encoder) marshal(v reflect.Value) (*plistValue, error) {
 
 		if !isIndirect(v) {
 			break
+		}
+		if v.Kind() == reflect.Ptr {
+			// A self-referential pointer (e.g. var v interface{}; v = &v)
+			// never reaches a terminal value. A chain that revisits an
+			// address is a cycle, so report it instead of looping forever.
+			// An UnsupportedValueError matches encoding/json, which
+			// reports "encountered a cycle via %s" the same way: the type
+			// itself is encodable, the value is not.
+			//
+			// Note: this guards the indirection chain only. Cycles back
+			// through containers (a map or slice containing itself) still
+			// recurse; that predates this change and is left for a
+			// follow-up.
+			if ptr := v.Pointer(); ptr != 0 {
+				if _, dup := seen[ptr]; dup {
+					return nil, &UnsupportedValueError{v, fmt.Sprintf("encountered a cycle via %s", v.Type())}
+				}
+				if seen == nil {
+					seen = make(map[uintptr]struct{})
+				}
+				seen[ptr] = struct{}{}
+			}
 		}
 		v = v.Elem()
 	}

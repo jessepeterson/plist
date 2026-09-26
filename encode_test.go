@@ -2,6 +2,7 @@ package plist
 
 import (
 	"bytes"
+	"errors"
 	"testing"
 	"time"
 )
@@ -780,5 +781,42 @@ func TestMarshalNilRoot(t *testing.T) {
 				t.Errorf("Marshal(%v) succeeded, want error", tt.in)
 			}
 		})
+	}
+}
+
+// marshalNoHang runs Marshal off the test goroutine so a regression that
+// hangs (rather than erroring) fails the test instead of the whole suite.
+func marshalNoHang(t *testing.T, in interface{}) error {
+	t.Helper()
+	errc := make(chan error, 1)
+	go func() {
+		_, err := Marshal(in)
+		errc <- err
+	}()
+	select {
+	case err := <-errc:
+		return err
+	case <-time.After(5 * time.Second):
+		t.Fatal("Marshal hung on cyclic value, want error")
+		return nil
+	}
+}
+
+// TestMarshalCyclicValue checks that a self-referential pointer reports an
+// error instead of hanging the encoder. A property list is a tree, so a
+// value that never resolves has no representation.
+//
+// Note: this guards the pointer/interface descent only. Cycles back through
+// containers (a map or slice containing itself) still recurse; that predates
+// the descent loop and is left for a follow-up.
+func TestMarshalCyclicValue(t *testing.T) {
+	t.Parallel()
+
+	var v interface{}
+	v = &v
+	err := marshalNoHang(t, v)
+	var uve *UnsupportedValueError
+	if !errors.As(err, &uve) {
+		t.Errorf("Marshal(self-referential interface) err = %v (%T), want *UnsupportedValueError", err, err)
 	}
 }
